@@ -29,7 +29,20 @@ Language: **English** | [中文](README.md)
 ## Screenshots
 Example UI from a local OpenClaw environment:
 
-<img src="docs/assets/usage-en.png" alt="OpenClaw Control Center usage screenshot" width="900" />
+<table>
+  <tr>
+    <td width="50%">
+      <img src="docs/assets/overview-focus-en.png" alt="OpenClaw Control Center overview control posture ring screenshot" width="100%" />
+    </td>
+    <td width="50%">
+      <img src="docs/assets/staff-en.png" alt="OpenClaw Control Center staff page screenshot" width="100%" />
+    </td>
+  </tr>
+  <tr>
+    <td><strong>Control ring</strong><br />See health, operating posture, and budget risk in one glance.</td>
+    <td><strong>Staff page</strong><br />See who is working now, who is on standby, recent output, and schedule state.</td>
+  </tr>
+</table>
 
 ## 5-minute start
 ```bash

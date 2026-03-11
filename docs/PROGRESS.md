@@ -1,5 +1,28 @@
 # Progress
 
+## Phase 138 (README screenshot set now highlights the control ring and staff page) — Completed
+- Scope:
+  - Replace the less distinctive README screenshot block with the two most representative surfaces: the control ring posture card and the staff page.
+  - Keep Chinese and English screenshot assets aligned with their matching README language.
+- Changed files:
+  - `README.md`
+  - `README.en.md`
+  - `docs/assets/overview-focus-zh.png`
+  - `docs/assets/overview-focus-en.png`
+  - `docs/assets/staff-zh.png`
+  - `docs/assets/staff-en.png`
+  - `.gitignore`
+  - `docs/PROGRESS.md`
+- Implementation:
+  - Generated fresh localized overview focus crops that center the circular control ring and its posture summary.
+  - Generated fresh localized staff-page screenshots that show the agent roster cards and current work state.
+  - Replaced the README screenshot section in both languages with the new representative pair and short operator-facing captions.
+  - Ignored temporary WebKit capture artifacts used during asset generation.
+- Verification:
+  - `npm run build`
+  - `npm test`
+  - `npm run smoke:ui`
+
 ## Phase 137 (English overview headline now reads Overview Control Center) — Completed
 - Scope:
   - Make the English top-level overview headline feel more branded by expanding `Overview` to `Overview Control Center`.
