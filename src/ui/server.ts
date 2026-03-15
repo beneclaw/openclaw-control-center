@@ -1,7 +1,7 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
-import { readdir, readFile, stat, writeFile } from "node:fs/promises";
+import { mkdir, readdir, readFile, stat, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, extname, join, relative, resolve } from "node:path";
 import {
@@ -112,6 +112,15 @@ import {
   loadBestEffortOfficeSessionPresence,
   type OfficeSessionPresenceSnapshot,
 } from "../runtime/office-session-presence";
+import {
+  AVATAR_UPLOADS_DIR,
+  loadAvatarPreferences,
+  listAvatarUploads,
+  resolveEffectiveAvatar,
+  saveAvatarPreferences,
+  upsertAgentAvatarPreference,
+  type AvatarMode,
+} from "../runtime/avatar-preferences";
 import type {
   AgentRunState,
   BudgetEvaluation,
@@ -163,6 +172,7 @@ const JSON_MAX_BYTES = 128 * 1024;
 const FORM_MAX_BYTES = 16 * 1024;
 const EDITABLE_TEXT_FILE_MAX_BYTES = 1024 * 1024;
 const EDITABLE_TEXT_CONTENT_MAX_CHARS = 240_000;
+const AVATAR_UPLOAD_MAX_BYTES = 2 * 1024 * 1024;
 const SEARCH_LIMIT_MAX = 200;
 const TASK_RUNTIME_ACTIVITY_WINDOW_MS = 6 * 60 * 60 * 1000;
 const STALLED_RUNNING_SESSION_WINDOW_MS = 2 * 60 * 60 * 1000;
@@ -1085,6 +1095,85 @@ export function startUiServer(port: number, toolClient: ToolClient): Server {
           preferences: saved.preferences,
           issues: saved.issues,
         });
+      }
+
+      if (method === "GET" && path === "/api/avatar/uploads") {
+        assertAllowedQueryParams(url.searchParams, [], true);
+        const uploads = await listAvatarUploads();
+        return writeJson(res, 200, {
+          ok: true,
+          directory: AVATAR_UPLOADS_DIR,
+          count: uploads.length,
+          uploads,
+        });
+      }
+
+      if (method === "POST" && path === "/api/avatar/uploads") {
+        assertMutationAuthorized(req, "/api/avatar/uploads");
+        assertJsonContentType(req);
+        const payload = expectObject(await readJsonBody(req), "avatar upload payload");
+        const dataUrl = optionalBoundedString(payload.dataUrl, "dataUrl", AVATAR_UPLOAD_MAX_BYTES * 2);
+        const fileNameHint = optionalBoundedString(payload.fileName, "fileName", 160);
+        if (!dataUrl) {
+          throw new RequestValidationError("dataUrl is required.", 400);
+        }
+        const saved = await writeAvatarUploadFromDataUrl({ dataUrl, fileNameHint });
+        return writeJson(res, 200, { ok: true, upload: saved });
+      }
+
+      if (method === "DELETE" && path.startsWith("/api/avatar/uploads/")) {
+        assertMutationAuthorized(req, "/api/avatar/uploads/:fileName");
+        assertAllowedQueryParams(url.searchParams, [], true);
+        const fileName = decodeURIComponent(path.slice("/api/avatar/uploads/".length));
+        const removed = await deleteAvatarUpload(fileName);
+        if (!removed) return writeApiError(res, 404, "NOT_FOUND", "Avatar file not found.");
+        return writeJson(res, 200, { ok: true, removed: fileName });
+      }
+
+      if (method === "GET" && path === "/api/avatar/preferences") {
+        assertAllowedQueryParams(url.searchParams, ["agentId"], true);
+        const agentId = normalizeQueryString(url.searchParams.get("agentId"), "agentId", 160, true);
+        const prefs = await loadAvatarPreferences();
+        const entry = agentId ? prefs.preferences.agents[agentId] ?? null : null;
+        return writeJson(res, 200, {
+          ok: true,
+          path: prefs.path,
+          agentId: agentId ?? null,
+          preference: entry,
+          preferencesUpdatedAt: prefs.preferences.updatedAt,
+          issues: prefs.issues,
+        });
+      }
+
+      if (method === "PATCH" && path === "/api/avatar/preferences") {
+        assertMutationAuthorized(req, "/api/avatar/preferences");
+        assertJsonContentType(req);
+        const payload = expectObject(await readJsonBody(req), "avatar preference payload");
+        const agentId = optionalBoundedString(payload.agentId, "agentId", 160);
+        const mode = optionalBoundedString(payload.mode, "mode", 24)?.trim().toLowerCase() as AvatarMode | undefined;
+        const animal = optionalBoundedString(payload.animal, "animal", 64);
+        const image = optionalBoundedString(payload.image, "image", 240);
+        if (!agentId) throw new RequestValidationError("agentId is required.", 400);
+        if (!mode || (mode !== "agent" && mode !== "pixel" && mode !== "custom")) {
+          throw new RequestValidationError("mode must be one of: agent, pixel, custom", 400);
+        }
+        const current = await loadAvatarPreferences();
+        const merged = upsertAgentAvatarPreference({
+          preferences: current.preferences,
+          agentId,
+          mode,
+          animal,
+          image,
+          now: new Date().toISOString(),
+        });
+        const saved = await saveAvatarPreferences(merged);
+        return writeJson(res, 200, { ok: true, path: saved.path, preferences: saved.preferences, issues: saved.issues });
+      }
+
+      if (method === "GET" && path.startsWith("/avatars/")) {
+        assertAllowedQueryParams(url.searchParams, [], true);
+        const fileName = decodeURIComponent(path.slice("/avatars/".length));
+        return await serveAvatarFile(res, fileName);
       }
 
       if (method === "GET" && path === "/api/search/tasks") {
@@ -4297,15 +4386,19 @@ async function renderHtml(
       };
   const sessionRows = renderSessionPreviewRows(sessionPreview.items, options.language);
   markRenderPhase("session-preview");
-  const [cronOverview, openclawCronJobs, replayPreview, usageCost, officeRoster, officePresence] = await Promise.all([
+  const [cronOverview, openclawCronJobs, replayPreview, usageCost, officeRoster, officePresence, avatarPreferences] = await Promise.all([
     buildCronOverview(snapshot, POLLING_INTERVALS_MS.cron),
     loadOpenclawCronCatalog(options.language),
     loadCachedReplayPreview(),
     loadCachedUsageCost(snapshot, usageCostMode),
     loadBestEffortAgentRoster(),
     loadCachedOfficeSessionPresence(),
+    loadAvatarPreferences(),
   ]);
   markRenderPhase("shared-data");
+  if (avatarPreferences.issues.length > 0) {
+    console.warn("[mission-control] avatar preferences normalized", { issues: avatarPreferences.issues });
+  }
   const [teamSnapshot, memoryFiles, memoryFacetOptions, workspaceFiles, workspaceFacetOptions, taskEvidenceItems, connectionHealthSummary, securitySummary, updateSummary, memoryStateSummary] = await Promise.all([
     needsTeamSnapshot
       ? loadTeamSnapshot(officeRoster)
@@ -4834,7 +4927,7 @@ async function renderHtml(
         language: options.language,
       })
     : [];
-  const staffOverviewCardsHtml = renderStaffOverviewCards(staffOverviewCards, options.language);
+  const staffOverviewCardsHtml = renderStaffOverviewCards(staffOverviewCards, avatarPreferences.preferences, options.language);
   const subscriptionStatusHtml = renderSubscriptionStatusCard(usageCost.subscription, options.language);
   const sectionNav = sectionLinks.map((item) => {
     const href = buildHomeHref(filters, options.compactStatusStrip, item.key, options.language, options.usageView);
@@ -6008,6 +6101,8 @@ async function renderHtml(
   const agentVisualEnhancerScript = renderAgentVisualEnhancerScript();
   const nativeMotionScript = renderNativeMotionScript(options.language);
   const quotaResetScript = renderQuotaResetScript();
+  const headerControlsScript = renderHeaderControlsScript(options.language);
+  const avatarEditorScript = renderAvatarEditorScript(options.language);
   const renderTotalMs = Math.round(performance.now() - renderStartedAt);
   if (renderTotalMs >= 1000) {
     console.warn("[mission-control] slow html render", {
@@ -6022,6 +6117,105 @@ async function renderHtml(
 <head>
   <meta charset="utf-8" />
   <title>OpenClaw Control Center</title>
+  <script>
+    (() => {
+      const key = 'openclaw:theme';
+      const stored = (() => { try { return window.localStorage.getItem(key) || ''; } catch { return ''; } })();
+      const prefersDark = (() => { try { return window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches; } catch { return false; } })();
+      const theme = (stored === 'dark' || stored === 'light') ? stored : (prefersDark ? 'dark' : 'light');
+      document.documentElement.dataset.theme = theme;
+    })();
+  </script>
+  <script>
+    (() => {
+      const restoreKey = 'openclaw:refresh-state:v1:' + location.pathname + location.search;
+
+      const captureState = () => {
+        const inputs = Array.from(document.querySelectorAll('input, textarea, select'));
+        const items = inputs.map((node) => {
+          const el = node;
+          const name = el.getAttribute('name') || '';
+          const id = el.getAttribute('id') || '';
+          const key = id ? ('#' + id) : (name ? (el.tagName.toLowerCase() + '[name="' + name.replace(/"/g, '\\"') + '"]') : '');
+          if (!key) return null;
+          const type = (el instanceof HTMLInputElement ? (el.type || '').toLowerCase() : '');
+          if (el instanceof HTMLInputElement && (type === 'checkbox' || type === 'radio')) {
+            return { key, kind: 'checked', value: Boolean(el.checked) };
+          }
+          const value = (el instanceof HTMLSelectElement || el instanceof HTMLTextAreaElement || el instanceof HTMLInputElement) ? el.value : '';
+          const selectionStart = (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) ? el.selectionStart : null;
+          const selectionEnd = (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) ? el.selectionEnd : null;
+          return { key, kind: 'value', value, selectionStart, selectionEnd };
+        }).filter(Boolean);
+
+        const focused = document.activeElement;
+        const focusedKey = (focused && focused instanceof HTMLElement)
+          ? (focused.id ? ('#' + focused.id) : (focused.getAttribute('name') ? (focused.tagName.toLowerCase() + '[name="' + focused.getAttribute('name').replace(/"/g, '\\"') + '"]') : ''))
+          : '';
+
+        return {
+          at: Date.now(),
+          scrollY: window.scrollY || 0,
+          focusedKey,
+          items,
+        };
+      };
+
+      const restoreState = (state) => {
+        if (!state || typeof state !== 'object') return;
+        const items = Array.isArray(state.items) ? state.items : [];
+        items.forEach((item) => {
+          if (!item || typeof item !== 'object') return;
+          const key = String(item.key || '');
+          if (!key) return;
+          const el = document.querySelector(key);
+          if (!el) return;
+          const kind = String(item.kind || '');
+          if (el instanceof HTMLInputElement && (el.type === 'checkbox' || el.type === 'radio') && kind === 'checked') {
+            el.checked = Boolean(item.value);
+            return;
+          }
+          if ((el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement || el instanceof HTMLSelectElement) && kind === 'value') {
+            el.value = String(item.value ?? '');
+            if (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) {
+              const ss = Number(item.selectionStart);
+              const se = Number(item.selectionEnd);
+              if (Number.isFinite(ss) && Number.isFinite(se)) {
+                try { el.setSelectionRange(ss, se); } catch {}
+              }
+            }
+          }
+        });
+
+        if (Number.isFinite(Number(state.scrollY))) {
+          window.scrollTo({ top: Number(state.scrollY), left: 0, behavior: 'instant' });
+        }
+        if (state.focusedKey && typeof state.focusedKey === 'string') {
+          const target = document.querySelector(state.focusedKey);
+          if (target && target instanceof HTMLElement) {
+            try { target.focus(); } catch {}
+          }
+        }
+      };
+
+      const boot = () => {
+        let raw = '';
+        try { raw = window.sessionStorage.getItem(restoreKey) || ''; } catch {}
+        if (!raw) return;
+        let parsed = null;
+        try { parsed = JSON.parse(raw); } catch { parsed = null; }
+        try { window.sessionStorage.removeItem(restoreKey); } catch {}
+        if (!parsed) return;
+        window.requestAnimationFrame(() => restoreState(parsed));
+      };
+
+      if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', boot, { once: true });
+      } else {
+        boot();
+      }
+    })();
+  </script>
   <style>
     :root {
       --bg: #eef2f6;
@@ -6074,6 +6268,54 @@ async function renderHtml(
       --space-2: 16px;
       --space-3: 24px;
       --space-4: 32px;
+      --page-bg:
+        radial-gradient(circle at 8% -10%, rgba(164, 192, 230, 0.22), transparent 34%),
+        radial-gradient(circle at 96% 0%, rgba(218, 226, 240, 0.18), transparent 32%),
+        linear-gradient(180deg, #f3f5f8 0%, #e9edf3 46%, #e5eaf0 100%);
+      --page-glow:
+        linear-gradient(180deg, rgba(255, 255, 255, 0.72), rgba(255, 255, 255, 0.16) 42%, transparent 60%),
+        radial-gradient(circle at 50% -18%, rgba(255, 255, 255, 0.54), transparent 46%);
+    }
+    html[data-theme="dark"] {
+      --bg: #0c111b;
+      --panel: rgba(18, 25, 38, 0.92);
+      --panel-soft: rgba(16, 22, 34, 0.92);
+      --surface-1: rgba(18, 25, 38, 0.9);
+      --surface-2: rgba(16, 22, 34, 0.88);
+      --surface-3: rgba(14, 20, 31, 0.86);
+      --glass-1: rgba(15, 22, 34, 0.72);
+      --glass-2: rgba(12, 18, 29, 0.66);
+      --border: rgba(226, 232, 240, 0.12);
+      --border-soft: rgba(226, 232, 240, 0.08);
+      --border-strong: rgba(226, 232, 240, 0.18);
+      --text: rgba(241, 245, 249, 0.92);
+      --muted: rgba(226, 232, 240, 0.66);
+      --todo: rgba(226, 232, 240, 0.62);
+      --card-fill:
+        linear-gradient(180deg, rgba(18, 25, 38, 0.96), rgba(14, 20, 31, 0.93) 56%, rgba(10, 15, 24, 0.9)),
+        radial-gradient(circle at 100% 0%, rgba(66, 113, 201, 0.14), transparent 54%);
+      --card-fill-soft:
+        linear-gradient(180deg, rgba(16, 22, 34, 0.95), rgba(12, 18, 29, 0.92) 58%, rgba(10, 15, 24, 0.9)),
+        radial-gradient(circle at 100% 0%, rgba(66, 113, 201, 0.11), transparent 52%);
+      --card-border: rgba(226, 232, 240, 0.12);
+      --card-border-strong: rgba(226, 232, 240, 0.18);
+      --shadow-soft: 0 10px 26px rgba(0, 0, 0, 0.36);
+      --shadow-hard: 0 22px 56px rgba(0, 0, 0, 0.48);
+      --shadow-float: 0 18px 44px rgba(0, 0, 0, 0.44);
+      --shadow-press: 0 10px 24px rgba(0, 0, 0, 0.42);
+      --card-shadow-soft: 0 16px 38px rgba(0, 0, 0, 0.34), 0 2px 10px rgba(0, 0, 0, 0.26);
+      --card-shadow: 0 22px 52px rgba(0, 0, 0, 0.38), 0 3px 12px rgba(0, 0, 0, 0.28);
+      --card-shadow-hover: 0 28px 64px rgba(0, 0, 0, 0.46), 0 4px 14px rgba(0, 0, 0, 0.3);
+      --ring-soft: 0 0 0 4px rgba(91, 175, 255, 0.18);
+      --focus: #5bafff;
+      --progress: #5bafff;
+      --page-bg:
+        radial-gradient(circle at 10% -10%, rgba(78, 132, 210, 0.22), transparent 40%),
+        radial-gradient(circle at 100% 0%, rgba(20, 30, 46, 0.72), transparent 34%),
+        linear-gradient(180deg, #0b1019 0%, #0a0f18 46%, #070b12 100%);
+      --page-glow:
+        linear-gradient(180deg, rgba(255, 255, 255, 0.06), rgba(255, 255, 255, 0.02) 42%, transparent 60%),
+        radial-gradient(circle at 50% -18%, rgba(91, 175, 255, 0.08), transparent 48%);
     }
     * { box-sizing: border-box; }
     body {
@@ -6083,10 +6325,7 @@ async function renderHtml(
       line-height: 1.58;
       margin: 0;
       min-height: 100vh;
-      background:
-        radial-gradient(circle at 8% -10%, rgba(164, 192, 230, 0.22), transparent 34%),
-        radial-gradient(circle at 96% 0%, rgba(218, 226, 240, 0.18), transparent 32%),
-        linear-gradient(180deg, #f3f5f8 0%, #e9edf3 46%, #e5eaf0 100%);
+      background: var(--page-bg);
       position: relative;
       text-rendering: optimizeLegibility;
       -webkit-font-smoothing: antialiased;
@@ -6098,9 +6337,7 @@ async function renderHtml(
       content: "";
       position: fixed;
       inset: 0;
-      background:
-        linear-gradient(180deg, rgba(255, 255, 255, 0.72), rgba(255, 255, 255, 0.16) 42%, transparent 60%),
-        radial-gradient(circle at 50% -18%, rgba(255, 255, 255, 0.54), transparent 46%);
+      background: var(--page-glow);
       pointer-events: none;
       z-index: -1;
     }
@@ -6162,6 +6399,19 @@ async function renderHtml(
         radial-gradient(circle at 82% 14%, rgba(255, 255, 255, 0.8), transparent 56%);
       box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.72);
     }
+    html[data-theme="dark"] .brand {
+      border: 1px solid rgba(226, 232, 240, 0.12);
+      background:
+        linear-gradient(135deg, rgba(21, 30, 48, 0.76), rgba(12, 18, 29, 0.86)),
+        radial-gradient(circle at 82% 14%, rgba(91, 175, 255, 0.12), transparent 56%);
+      box-shadow: inset 0 0 0 1px rgba(226, 232, 240, 0.08);
+    }
+    .brand-bar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+    }
     .brand-kicker {
       display: inline-flex;
       align-items: center;
@@ -6176,6 +6426,40 @@ async function renderHtml(
       background: rgba(255, 255, 255, 0.84);
       text-transform: uppercase;
     }
+    html[data-theme="dark"] .brand-kicker {
+      border: 1px solid rgba(91, 175, 255, 0.26);
+      color: rgba(207, 232, 255, 0.95);
+      background: rgba(12, 18, 29, 0.68);
+    }
+    .brand-actions {
+      display: inline-flex;
+      align-items: center;
+      justify-content: flex-end;
+      gap: 8px;
+    }
+    .icon-btn {
+      width: 30px;
+      height: 30px;
+      border-radius: 10px;
+      border: 1px solid var(--border-soft);
+      background: rgba(255, 255, 255, 0.62);
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+      transition: transform 140ms ease, box-shadow 140ms ease, background 140ms ease, border-color 140ms ease;
+      box-shadow: 0 10px 20px rgba(15, 23, 42, 0.06);
+      color: var(--text);
+    }
+    html[data-theme="dark"] .icon-btn {
+      background: rgba(12, 18, 29, 0.62);
+      box-shadow: 0 12px 24px rgba(0, 0, 0, 0.36);
+    }
+    .icon-btn:hover { transform: translateY(-1px); box-shadow: 0 14px 28px rgba(15, 23, 42, 0.1); border-color: var(--border); }
+    .icon-btn:active { transform: translateY(0); box-shadow: var(--shadow-press); }
+    .icon-btn:focus-visible { outline: none; box-shadow: var(--ring-soft); }
+    .icon-btn[aria-busy="true"] { cursor: progress; opacity: 0.86; }
+    .icon-btn svg { width: 16px; height: 16px; }
     .brand h1 { font-size: 23px; font-weight: 760; margin-top: 9px; }
     .brand .meta { margin-top: 6px; }
     .meta { color: var(--muted); font-size: 13px; line-height: 1.62; }
@@ -7458,11 +7742,502 @@ async function renderHtml(
       box-shadow:
         inset 0 1px 0 rgba(255, 255, 255, 0.8),
         0 10px 20px rgba(17, 24, 39, 0.05);
+      position: relative;
     }
     .staff-avatar .agent-stage {
       aspect-ratio: 1 / 1;
       border-radius: 12px;
+      overflow: hidden;
+      display: grid;
+      place-items: center;
     }
+    .agent-avatar-img {
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      border-radius: inherit;
+      display: block;
+    }
+    .avatar-edit-btn {
+      position: absolute;
+      top: 9px;
+      right: 9px;
+      width: 32px;
+      height: 32px;
+      border-radius: 12px;
+      border: 1px solid rgba(17, 24, 39, 0.12);
+      background: rgba(255, 255, 255, 0.72);
+      box-shadow: 0 10px 20px rgba(17, 24, 39, 0.09);
+      color: rgba(29, 29, 31, 0.92);
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      opacity: 0;
+      transform: translateY(-2px);
+      pointer-events: none;
+      transition: opacity 140ms ease, transform 160ms ease, box-shadow 160ms ease, background 160ms ease;
+    }
+    .staff-avatar:hover .avatar-edit-btn,
+    .agent-avatar:hover .avatar-edit-btn {
+      opacity: 1;
+      transform: translateY(0);
+      pointer-events: auto;
+    }
+    .avatar-edit-btn:focus-visible {
+      outline: none;
+      box-shadow: var(--ring-soft);
+      opacity: 1;
+      pointer-events: auto;
+    }
+    html[data-theme="dark"] .avatar-edit-btn {
+      border-color: rgba(226, 232, 240, 0.18);
+      background: rgba(12, 18, 29, 0.72);
+      color: rgba(241, 245, 249, 0.92);
+      box-shadow: 0 12px 24px rgba(0, 0, 0, 0.46);
+    }
+    .avatar-edit-btn svg { width: 16px; height: 16px; }
+    .avatar-edit-btn,
+    .avatar-edit-btn svg,
+    .avatar-edit-btn path { pointer-events: auto; }
+    .avatar-edit-btn svg,
+    .avatar-edit-btn path { pointer-events: none; }
+    .avatar-edit-btn { z-index: 2; }
+    .avatar-modal-backdrop {
+      position: fixed;
+      inset: 0;
+      z-index: 1200;
+      display: grid;
+      place-items: center;
+      padding: 24px;
+      background: rgba(10, 15, 24, 0.38);
+      backdrop-filter: blur(18px);
+      -webkit-backdrop-filter: blur(18px);
+    }
+    html[data-theme="dark"] .avatar-modal-backdrop { background: rgba(0, 0, 0, 0.52); }
+    .avatar-modal {
+      width: min(920px, 100%);
+      border-radius: 22px;
+      border: 1px solid var(--card-border);
+      background: var(--card-fill);
+      box-shadow: var(--shadow-hard);
+      overflow: hidden;
+    }
+    .avatar-modal-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 14px 16px;
+      border-bottom: 1px solid var(--border-soft);
+      background: linear-gradient(180deg, var(--surface-1), var(--surface-2));
+    }
+    .avatar-modal-title { font-weight: 720; letter-spacing: -0.02em; }
+    .avatar-modal-actions { display: inline-flex; gap: 8px; align-items: center; }
+    .avatar-sync-btn { height: 34px; padding: 0 12px; border-radius: 12px; }
+    .avatar-modal-close {
+      width: 36px;
+      height: 36px;
+      border-radius: 12px;
+      border: 1px solid var(--border-soft);
+      background: transparent;
+      cursor: pointer;
+      color: var(--text);
+    }
+    .avatar-modal-close:hover { background: rgba(255, 255, 255, 0.42); }
+    html[data-theme="dark"] .avatar-modal-close:hover { background: rgba(255, 255, 255, 0.06); }
+    .avatar-modal-body { padding: 16px; display: grid; grid-template-columns: 220px minmax(0, 1fr); gap: 14px; }
+    .avatar-preview {
+      border: 1px solid var(--border-soft);
+      border-radius: 18px;
+      padding: 12px;
+      background: linear-gradient(180deg, var(--surface-1), var(--surface-2));
+      box-shadow: var(--shadow-soft);
+      display: grid;
+      gap: 10px;
+      align-content: start;
+    }
+    .avatar-preview .agent-stage { width: 100%; aspect-ratio: 1 / 1; border-radius: 14px; overflow: hidden; }
+    .avatar-tabs { display: inline-flex; gap: 8px; flex-wrap: wrap; }
+    .avatar-tab {
+      border: 1px solid var(--border-soft);
+      background: rgba(255, 255, 255, 0.62);
+      color: var(--text);
+      border-radius: 999px;
+      padding: 8px 12px;
+      font-weight: 650;
+      cursor: pointer;
+    }
+    html[data-theme="dark"] .avatar-tab { background: rgba(12, 18, 29, 0.62); }
+    .avatar-tab.active { border-color: rgba(0, 113, 227, 0.42); box-shadow: var(--ring-soft); }
+    .avatar-panel { display: grid; gap: 12px; align-content: start; }
+    .avatar-grid {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 10px;
+    }
+    @media (max-width: 740px) {
+      .avatar-modal-body { grid-template-columns: 1fr; }
+      .avatar-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    }
+    .avatar-choice {
+      border: 1px solid var(--border-soft);
+      background: linear-gradient(180deg, var(--surface-1), var(--surface-2));
+      border-radius: 16px;
+      padding: 10px;
+      cursor: pointer;
+      box-shadow: var(--shadow-soft);
+      transition: transform 140ms ease, box-shadow 160ms ease, border-color 160ms ease;
+      display: grid;
+      gap: 8px;
+      place-items: center;
+    }
+    .avatar-choice:hover { transform: translateY(-1px); box-shadow: var(--shadow-float); border-color: var(--border); }
+    .avatar-choice:focus-visible { outline: none; box-shadow: var(--ring-soft); }
+    .avatar-choice .avatar-choice-label { font-size: 12px; color: var(--muted); text-align: center; }
+    .avatar-upload-row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+    .avatar-upload-btn { padding: 10px 14px; border-radius: 14px; }
+    .avatar-upload-list { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; }
+    @media (max-width: 740px) { .avatar-upload-list { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
+    .avatar-upload-item { position: relative; border-radius: 16px; overflow: hidden; border: 1px solid var(--border-soft); background: var(--surface-2); }
+    .avatar-upload-item img { width: 100%; height: 100%; aspect-ratio: 1 / 1; object-fit: cover; display: block; }
+    .avatar-upload-actions { position: absolute; inset: auto 8px 8px 8px; display: flex; gap: 8px; }
+    .avatar-mini-btn {
+      flex: 1;
+      border-radius: 12px;
+      border: 1px solid rgba(0,0,0,0.08);
+      background: rgba(255,255,255,0.86);
+      padding: 7px 10px;
+      cursor: pointer;
+      font-weight: 650;
+      font-size: 12px;
+    }
+    html[data-theme="dark"] .avatar-mini-btn { border-color: rgba(226,232,240,0.14); background: rgba(12,18,29,0.72); color: var(--text); }
+    .avatar-crop-shell { display: grid; gap: 12px; }
+    .avatar-crop-canvas { width: 100%; max-width: 420px; border-radius: 18px; border: 1px solid var(--border-soft); background: rgba(0,0,0,0.1); }
+    .avatar-crop-controls { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+    .avatar-token-row { margin-top: 6px; display: grid; gap: 6px; }
+    html[data-theme="dark"] a { color: var(--focus); }
+    html[data-theme="dark"] .nav-link span,
+    html[data-theme="dark"] .section-title,
+    html[data-theme="dark"] .overview-pulse-card .status-chip strong,
+    html[data-theme="dark"] .card h2 { color: var(--text); }
+    html[data-theme="dark"] .meta,
+    html[data-theme="dark"] .section-blurb,
+    html[data-theme="dark"] .staff-role,
+    html[data-theme="dark"] .overview-busy-copy,
+    html[data-theme="dark"] .overview-pulse-card .status-chip span,
+    html[data-theme="dark"] .overview-kpi-detail,
+    html[data-theme="dark"] .overview-kpi-label,
+    html[data-theme="dark"] .overview-kpi-value,
+    html[data-theme="dark"] .overview-primary-card .overview-primary-value,
+    html[data-theme="dark"] .overview-primary-card .overview-primary-label { color: var(--muted); }
+    html[data-theme="dark"] .panel,
+    html[data-theme="dark"] .sidebar { border-color: var(--border); }
+    html[data-theme="dark"] .nav-link {
+      background: linear-gradient(180deg, rgba(14, 20, 31, 0.92), rgba(10, 15, 24, 0.9));
+      border-color: var(--border-soft);
+    }
+    html[data-theme="dark"] .nav-link.active {
+      background: linear-gradient(180deg, rgba(22, 35, 52, 0.94), rgba(12, 18, 29, 0.92));
+      border-color: rgba(91, 175, 255, 0.34);
+    }
+    html[data-theme="dark"] .nav-link:hover {
+      background: linear-gradient(180deg, rgba(22, 35, 52, 0.98), rgba(12, 18, 29, 0.96));
+      border-color: rgba(91, 175, 255, 0.24);
+      box-shadow: 0 14px 30px rgba(0, 0, 0, 0.45);
+    }
+    html[data-theme="dark"] .quick-chip,
+    html[data-theme="dark"] .segment-switch,
+    html[data-theme="dark"] .segment-item,
+    html[data-theme="dark"] .badge,
+    html[data-theme="dark"] .btn,
+    html[data-theme="dark"] .panel-toggle {
+      background: rgba(12, 18, 29, 0.72);
+      color: var(--text);
+      border-color: var(--border-soft);
+    }
+    html[data-theme="dark"] .segment-item.active,
+    html[data-theme="dark"] .quick-chip.active {
+      border-color: rgba(91, 175, 255, 0.44);
+      color: #cfe8ff;
+      background: rgba(24, 38, 56, 0.86);
+    }
+    html[data-theme="dark"] .overview-usage-card,
+    html[data-theme="dark"] .overview-pulse-card,
+    html[data-theme="dark"] .overview-kpi-card,
+    html[data-theme="dark"] .overview-primary-card,
+    html[data-theme="dark"] .summary-gauge-card {
+      background: var(--card-fill);
+    }
+    html[data-theme="dark"] .status-chip,
+    html[data-theme="dark"] .usage-chip {
+      background: rgba(12, 18, 29, 0.72);
+      border-color: var(--border-soft);
+    }
+    html[data-theme="dark"] .status-chip.usage-chip { box-shadow: var(--shadow-soft); }
+    html[data-theme="dark"] table,
+    html[data-theme="dark"] th,
+    html[data-theme="dark"] td {
+      border-color: var(--border-soft);
+      color: var(--text);
+    }
+    html[data-theme="dark"] tr:hover td { background: rgba(20, 30, 46, 0.72); }
+    html[data-theme="dark"] input,
+    html[data-theme="dark"] textarea,
+    html[data-theme="dark"] select {
+      background: rgba(12, 18, 29, 0.72);
+      color: var(--text);
+      border-color: var(--border-soft);
+    }
+    html[data-theme="dark"] .agent-animal-label,
+    html[data-theme="dark"] .staff-brief-identity h3,
+    html[data-theme="dark"] .office-info strong { color: var(--text); }
+    html[data-theme="dark"] .office-card,
+    html[data-theme="dark"] .staff-brief-card,
+    html[data-theme="dark"] .desk-chip,
+    html[data-theme="dark"] .group-item,
+    html[data-theme="dark"] .task-card,
+    html[data-theme="dark"] .project-card {
+      border-color: var(--card-border);
+      background: var(--card-fill);
+    }
+    html[data-theme="dark"] details summary { color: var(--text); }
+    html[data-theme="dark"] .card.compact-details summary { color: var(--text); }
+    html[data-theme="dark"] .card.compact-details summary::after,
+    html[data-theme="dark"] .compact-table-details summary::after {
+      border-color: rgba(226, 232, 240, 0.16);
+      background: rgba(12, 18, 29, 0.72);
+      color: var(--muted);
+    }
+    html[data-theme="dark"] code { color: #7dd3fc; }
+    html[data-theme="dark"] .quota-row {
+      border-color: rgba(226, 232, 240, 0.12);
+      background: rgba(12, 18, 29, 0.72);
+    }
+    html[data-theme="dark"] .quota-label { color: var(--text); }
+    html[data-theme="dark"] .quota-track {
+      border-color: rgba(226, 232, 240, 0.16);
+      background: rgba(23, 35, 52, 0.72);
+    }
+    html[data-theme="dark"] .subscription-pill,
+    html[data-theme="dark"] .file-sidebar {
+      border-color: rgba(226, 232, 240, 0.12);
+      background: rgba(12, 18, 29, 0.72);
+      box-shadow: var(--shadow-soft);
+    }
+    html[data-theme="dark"] .file-nav-item {
+      border-color: rgba(226, 232, 240, 0.12);
+      background: rgba(12, 18, 29, 0.72);
+      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04);
+    }
+    html[data-theme="dark"] .file-nav-item:hover {
+      background: rgba(18, 28, 44, 0.86);
+      border-color: rgba(91, 175, 255, 0.24);
+      box-shadow: 0 12px 24px rgba(0, 0, 0, 0.4);
+    }
+    html[data-theme="dark"] .file-nav-item.active {
+      background: rgba(22, 35, 52, 0.92);
+      border-color: rgba(91, 175, 255, 0.34);
+      box-shadow: 0 14px 28px rgba(0, 0, 0, 0.48);
+    }
+    html[data-theme="dark"] .file-facet-switch .segment-item:hover {
+      border-color: rgba(226, 232, 240, 0.2);
+      background: rgba(18, 28, 44, 0.86);
+      box-shadow: 0 12px 24px rgba(0, 0, 0, 0.36);
+    }
+    html[data-theme="dark"] .file-filter-input,
+    html[data-theme="dark"] .file-token-input {
+      background: rgba(12, 18, 29, 0.72);
+      color: var(--text);
+      border-color: rgba(226, 232, 240, 0.16);
+      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06);
+    }
+    html[data-theme="dark"] .panel {
+      background: rgba(8, 12, 19, 0.16);
+    }
+    html[data-theme="dark"] .mission-banner {
+      background: rgba(12, 18, 29, 0.72);
+      border-color: rgba(226, 232, 240, 0.12);
+      color: var(--text);
+    }
+    html[data-theme="dark"] .overview-primary-directive { color: var(--text); }
+    html[data-theme="dark"] .usage-chip,
+    html[data-theme="dark"] .status-chip.usage-chip {
+      background: rgba(12, 18, 29, 0.72);
+      border-color: rgba(226, 232, 240, 0.12);
+    }
+    html[data-theme="dark"] .exec-metric,
+    html[data-theme="dark"] .signal-gauge-core { color: var(--text); }
+    html[data-theme="dark"] strong { color: var(--text); }
+    html[data-theme="dark"] span { color: var(--muted); }
+    html[data-theme="dark"] small { color: var(--muted); }
+    html[data-theme="dark"] dt { color: var(--muted); }
+    html[data-theme="dark"] dd { color: var(--text); }
+    html[data-theme="dark"] .file-sidebar-tools .meta,
+    html[data-theme="dark"] .file-nav-title { color: var(--text); }
+    html[data-theme="dark"] .file-nav-meta,
+    html[data-theme="dark"] .file-editor-title,
+    html[data-theme="dark"] .file-editor-textarea {
+      color: var(--text);
+    }
+    html[data-theme="dark"] .file-editor-textarea {
+      background: rgba(12, 18, 29, 0.72);
+      border-color: rgba(226, 232, 240, 0.16);
+    }
+    html[data-theme="dark"] .decision-row:hover,
+    html[data-theme="dark"] .overview-action-item:hover {
+      background: rgba(18, 28, 44, 0.86);
+    }
+    html[data-theme="dark"] .card::before {
+      box-shadow:
+        inset 0 1px 0 rgba(255, 255, 255, 0.06),
+        inset 0 -1px 0 rgba(255, 255, 255, 0.04);
+    }
+    html[data-theme="dark"] .status-chip strong { color: var(--text); }
+    html[data-theme="dark"] .status-chip span { color: var(--muted); }
+    html[data-theme="dark"] .overview-primary-card {
+      background:
+        linear-gradient(150deg, rgba(18, 28, 44, 0.95), rgba(10, 15, 24, 0.92)),
+        radial-gradient(circle at 88% 18%, rgba(91, 175, 255, 0.18), transparent 52%);
+      border-color: rgba(91, 175, 255, 0.32);
+      box-shadow: 0 20px 42px rgba(0, 0, 0, 0.45);
+    }
+    html[data-theme="dark"] .overview-primary-card::after {
+      background: radial-gradient(circle, rgba(91, 175, 255, 0.22), transparent 66%);
+    }
+    html[data-theme="dark"] .overview-primary-value,
+    html[data-theme="dark"] .overview-focus-score { color: var(--text); }
+    html[data-theme="dark"] .overview-focus-stage {
+      border-color: rgba(226, 232, 240, 0.12);
+      background: rgba(12, 18, 29, 0.72);
+    }
+    html[data-theme="dark"] .overview-focus-ring {
+      border-color: rgba(226, 232, 240, 0.18);
+      box-shadow: inset 0 0 0 1px rgba(226, 232, 240, 0.08);
+    }
+    html[data-theme="dark"] .overview-focus-core {
+      background: rgba(12, 18, 29, 0.92);
+      border-color: rgba(226, 232, 240, 0.14);
+    }
+    html[data-theme="dark"] .overview-primary-directive,
+    html[data-theme="dark"] .overview-primary-label { color: var(--muted); }
+    html[data-theme="dark"] .overview-focus-headline { color: var(--text); }
+    html[data-theme="dark"] .overview-focus-sub,
+    html[data-theme="dark"] .overview-focus-meta,
+    html[data-theme="dark"] .overview-focus-unit { color: var(--muted); }
+    html[data-theme="dark"] #usage-pulse .usage-chip {
+      background: rgba(12, 18, 29, 0.72);
+      border-color: rgba(226, 232, 240, 0.12);
+    }
+    html[data-theme="dark"] #usage-pulse .usage-chip span,
+    html[data-theme="dark"] #usage-pulse .usage-chip strong { color: var(--text); }
+    html[data-theme="dark"] #usage-pulse .usage-chip {
+      background: rgba(12, 18, 29, 0.72);
+      border-color: rgba(226, 232, 240, 0.12);
+    }
+    html[data-theme="dark"] #usage-pulse .usage-chip span,
+    html[data-theme="dark"] #usage-pulse .usage-chip strong { color: var(--text); }
+    html[data-theme="dark"] .signal-gauge-core {
+      background: rgba(12, 18, 29, 0.92);
+      border-color: rgba(226, 232, 240, 0.16);
+    }
+    html[data-theme="dark"] .signal-gauge-meta small { color: var(--muted); }
+    html[data-theme="dark"] .signal-gauge-meta a { color: var(--focus); }
+    html[data-theme="dark"] .cron-owner-card {
+      border-color: rgba(226, 232, 240, 0.12);
+      background: rgba(12, 18, 29, 0.72);
+      box-shadow: var(--shadow-soft);
+    }
+    html[data-theme="dark"] .cron-owner-head h3,
+    html[data-theme="dark"] .cron-job-head strong { color: var(--text); }
+    html[data-theme="dark"] .cron-job-list li {
+      border-color: rgba(226, 232, 240, 0.12);
+      background: rgba(18, 28, 44, 0.86);
+    }
+    html[data-theme="dark"] .calendar-day {
+      border-color: rgba(226, 232, 240, 0.12);
+      background: rgba(12, 18, 29, 0.72);
+      box-shadow: var(--shadow-soft);
+    }
+    html[data-theme="dark"] .calendar-day h3 { color: var(--text); }
+    html[data-theme="dark"] .calendar-event {
+      border-color: rgba(226, 232, 240, 0.12);
+      background: rgba(18, 28, 44, 0.86);
+    }
+    html[data-theme="dark"] .file-editor-panel {
+      border-color: rgba(226, 232, 240, 0.12);
+      background: rgba(12, 18, 29, 0.72);
+      box-shadow: var(--shadow-soft);
+    }
+    html[data-theme="dark"] .pie-chart {
+      border-color: rgba(226, 232, 240, 0.18);
+      box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.08), 0 8px 18px rgba(0, 0, 0, 0.4);
+    }
+    html[data-theme="dark"] .pie-hole {
+      border-color: rgba(226, 232, 240, 0.16);
+      background: rgba(12, 18, 29, 0.92);
+    }
+    html[data-theme="dark"] .pie-hole strong { color: var(--text); }
+    html[data-theme="dark"] .pie-legend li { color: var(--text); border-bottom-color: rgba(226, 232, 240, 0.12); }
+    html[data-theme="dark"] summary { color: var(--text); }
+    html[data-theme="dark"] .empty-state {
+      border-color: rgba(226, 232, 240, 0.16);
+      background: rgba(18, 28, 44, 0.72);
+      color: var(--muted);
+    }
+    html[data-theme="dark"] .overview-focus-headline { color: var(--text); }
+    html[data-theme="dark"] .overview-focus-sub,
+    html[data-theme="dark"] .overview-focus-meta,
+    html[data-theme="dark"] .overview-focus-unit { color: var(--muted); }
+    html[data-theme="dark"] .overview-primary-directive {
+      border-color: rgba(91, 175, 255, 0.28);
+      background: rgba(18, 28, 44, 0.86);
+      color: #cfe8ff;
+    }
+    html[data-theme="dark"] .signal-gauge-core {
+      background: rgba(12, 18, 29, 0.92);
+      border-color: rgba(226, 232, 240, 0.16);
+    }
+    html[data-theme="dark"] .signal-gauge-meta small { color: var(--muted); }
+    html[data-theme="dark"] .signal-gauge-meta a { color: var(--focus); }
+    html[data-theme="dark"] .cron-owner-card {
+      border-color: rgba(226, 232, 240, 0.12);
+      background: rgba(12, 18, 29, 0.72);
+      box-shadow: var(--shadow-soft);
+    }
+    html[data-theme="dark"] .cron-owner-head h3,
+    html[data-theme="dark"] .cron-job-head strong { color: var(--text); }
+    html[data-theme="dark"] .cron-job-list li {
+      border-color: rgba(226, 232, 240, 0.12);
+      background: rgba(18, 28, 44, 0.86);
+    }
+    html[data-theme="dark"] .calendar-day {
+      border-color: rgba(226, 232, 240, 0.12);
+      background: rgba(12, 18, 29, 0.72);
+      box-shadow: var(--shadow-soft);
+    }
+    html[data-theme="dark"] .calendar-day h3 { color: var(--text); }
+    html[data-theme="dark"] .calendar-event {
+      border-color: rgba(226, 232, 240, 0.12);
+      background: rgba(18, 28, 44, 0.86);
+    }
+    html[data-theme="dark"] .file-editor-panel {
+      border-color: rgba(226, 232, 240, 0.12);
+      background: rgba(12, 18, 29, 0.72);
+      box-shadow: var(--shadow-soft);
+    }
+    html[data-theme="dark"] .pie-chart {
+      border-color: rgba(226, 232, 240, 0.18);
+      box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.08), 0 8px 18px rgba(0, 0, 0, 0.4);
+    }
+    html[data-theme="dark"] .pie-hole {
+      border-color: rgba(226, 232, 240, 0.16);
+      background: rgba(12, 18, 29, 0.92);
+    }
+    html[data-theme="dark"] .pie-hole strong { color: var(--text); }
+    html[data-theme="dark"] .pie-legend li { color: var(--text); border-bottom-color: rgba(226, 232, 240, 0.12); }
+    html[data-theme="dark"] summary { color: var(--text); }
     .staff-brief-identity h3 {
       margin: 0;
       font-size: 20px;
@@ -8012,11 +8787,27 @@ async function renderHtml(
     }
   </style>
 </head>
-<body class="ui-preload" data-ui-polish="apple-native-v3" data-apple-window-controls="true" data-ui-language="${escapeHtml(options.language)}" style="--fold-open-label:${options.language === "en" ? "'Expand'" : "'展开'"}; --fold-close-label:${options.language === "en" ? "'Collapse'" : "'收起'"};">
+<body class="ui-preload" data-ui-polish="apple-native-v3" data-apple-window-controls="true" data-ui-language="${escapeHtml(options.language)}" data-token-required="${LOCAL_TOKEN_AUTH_REQUIRED ? "1" : "0"}" data-token-configured="${LOCAL_API_TOKEN ? "1" : "0"}" data-local-token-header="${escapeHtml(LOCAL_TOKEN_HEADER)}" style="--fold-open-label:${options.language === "en" ? "'Expand'" : "'展开'"}; --fold-close-label:${options.language === "en" ? "'Collapse'" : "'收起'"};">
   <div class="app-shell">
     <aside class="sidebar">
       <div class="brand">
-        <div class="brand-kicker">OpenClaw</div>
+        <div class="brand-bar">
+          <div class="brand-kicker">OpenClaw</div>
+          <div class="brand-actions">
+            <button id="theme-toggle" type="button" class="icon-btn" aria-label="${escapeHtml(t("Toggle theme", "切换主题"))}" title="${escapeHtml(t("Toggle theme", "切换主题"))}">
+              <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                <path d="M12 18.5a6.5 6.5 0 1 0 0-13a6.5 6.5 0 0 0 0 13Z" stroke="currentColor" stroke-width="1.8"/>
+                <path d="M12 2.8v2.2M12 19v2.2M3.6 12h2.2M18.2 12h2.2M5.1 5.1l1.6 1.6M17.3 17.3l1.6 1.6M18.9 5.1l-1.6 1.6M6.7 17.3l-1.6 1.6" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+              </svg>
+            </button>
+            <button id="data-refresh" type="button" class="icon-btn" aria-label="${escapeHtml(t("Refresh data", "刷新数据"))}" title="${escapeHtml(t("Refresh data", "刷新数据"))}">
+              <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                <path d="M20 12a8 8 0 1 1-2.34-5.66" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+                <path d="M20 4v6h-6" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+              </svg>
+            </button>
+          </div>
+        </div>
         <h1>OpenClaw Control Center</h1>
         <div class="meta">${escapeHtml(t("Updated", "更新时间"))}${escapeHtml(options.language === "en" ? ": " : "：")}${escapeHtml(snapshot.generatedAt ?? t("Not available", "暂无"))}</div>
         ${languageToggle}
@@ -8079,6 +8870,8 @@ async function renderHtml(
   ${fileWorkbenchScript}
   ${nativeMotionScript}
   ${quotaResetScript}
+  ${headerControlsScript}
+  ${avatarEditorScript}
 </body>
 </html>`;
 }
@@ -10490,7 +11283,11 @@ export async function buildStaffOverviewCards(input: {
   }));
 }
 
-function renderStaffOverviewCards(cards: StaffOverviewCard[], language: UiLanguage = "zh"): string {
+function renderStaffOverviewCards(
+  cards: StaffOverviewCard[],
+  avatarPreferences: Awaited<ReturnType<typeof loadAvatarPreferences>>["preferences"],
+  language: UiLanguage = "zh",
+): string {
   if (cards.length === 0) {
     return `<div class="empty-state">${escapeHtml(
       pickUiText(language, "No staff summary is available yet.", "当前没有可显示的员工摘要。"),
@@ -10499,10 +11296,23 @@ function renderStaffOverviewCards(cards: StaffOverviewCard[], language: UiLangua
 
   return `<div class="staff-brief-grid">${cards
     .map((card) => {
-      const avatar = `<div class="staff-avatar" style="--agent-accent:${escapeHtml(card.identity.accent)};" data-agent-id="${escapeHtml(card.agentId)}" data-animal="${escapeHtml(card.identity.animal)}">
-        <div class="agent-stage" aria-hidden="true">
-          <canvas class="agent-pixel-canvas" width="256" height="256"></canvas>
-        </div>
+      const effective = resolveEffectiveAvatar({
+        agentId: card.agentId,
+        agentAnimal: card.identity.animal,
+        preferences: avatarPreferences,
+      });
+      const stageInner =
+        effective.mode === "custom"
+          ? `<img class="agent-avatar-img" src="/avatars/${escapeHtml(effective.image)}" alt="${escapeHtml(card.displayName)}" loading="lazy" />`
+          : `<canvas class="agent-pixel-canvas" width="256" height="256"></canvas>`;
+      const avatar = `<div class="staff-avatar" style="--agent-accent:${escapeHtml(card.identity.accent)};" data-agent-id="${escapeHtml(card.agentId)}" data-animal="${escapeHtml(card.identity.animal)}" data-avatar-mode="${escapeHtml(effective.mode)}" data-avatar-image="${escapeHtml(effective.mode === "custom" ? effective.image : "")}">
+        <div class="agent-stage" aria-hidden="true">${stageInner}</div>
+        <button type="button" class="avatar-edit-btn" aria-label="${escapeHtml(pickUiText(language, "Edit avatar", "编辑头像"))}" title="${escapeHtml(pickUiText(language, "Edit avatar", "编辑头像"))}">
+          <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+            <path d="M4 20h4l10.6-10.6a2.2 2.2 0 0 0 0-3.1l-0.9-0.9a2.2 2.2 0 0 0-3.1 0L4 16v4Z" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/>
+            <path d="M13.8 6.2l4 4" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+          </svg>
+        </button>
       </div>`;
       return `<article class="staff-brief-card">
         <div class="staff-brief-head">
@@ -11016,7 +11826,11 @@ function renderTaskExecutionChainCards(
     .join("")}</div>`;
 }
 
-function renderOfficeCards(cards: OfficeSpaceCard[], language: UiLanguage = "zh"): string {
+function renderOfficeCards(
+  cards: OfficeSpaceCard[],
+  avatarPreferences: Awaited<ReturnType<typeof loadAvatarPreferences>>["preferences"],
+  language: UiLanguage = "zh",
+): string {
   if (cards.length === 0) {
     return `<div class="empty-state">${escapeHtml(
       pickUiText(language, "No staff roster signal yet. It will appear after config or runtime data is connected.", "暂无助手名录信号。连接配置或运行态后会显示。"),
@@ -11031,11 +11845,24 @@ function renderOfficeCards(cards: OfficeSpaceCard[], language: UiLanguage = "zh"
           : `<div class="meta">当前重点：</div><ul class="office-focus">${card.focusItems
               .map((item) => `<li>${escapeHtml(item)}</li>`)
               .join("")}</ul>`;
-      const avatar = `<div class="agent-avatar" style="--agent-accent:${escapeHtml(card.identity.accent)};" data-agent-id="${escapeHtml(card.agentId)}" data-animal="${escapeHtml(card.identity.animal)}">
-        <div class="agent-stage" aria-hidden="true">
-          <canvas class="agent-pixel-canvas" width="224" height="160"></canvas>
-        </div>
+      const effective = resolveEffectiveAvatar({
+        agentId: card.agentId,
+        agentAnimal: card.identity.animal,
+        preferences: avatarPreferences,
+      });
+      const stageInner =
+        effective.mode === "custom"
+          ? `<img class="agent-avatar-img" src="/avatars/${escapeHtml(effective.image)}" alt="${escapeHtml(card.agentId)}" loading="lazy" />`
+          : `<canvas class="agent-pixel-canvas" width="224" height="160"></canvas>`;
+      const avatar = `<div class="agent-avatar" style="--agent-accent:${escapeHtml(card.identity.accent)};" data-agent-id="${escapeHtml(card.agentId)}" data-animal="${escapeHtml(card.identity.animal)}" data-avatar-mode="${escapeHtml(effective.mode)}" data-avatar-image="${escapeHtml(effective.mode === "custom" ? effective.image : "")}">
+        <div class="agent-stage" aria-hidden="true">${stageInner}</div>
         <div class="agent-animal-label">${escapeHtml(animalLabel(card.identity.animal, language))}</div>
+        <button type="button" class="avatar-edit-btn" aria-label="${escapeHtml(pickUiText(language, "Edit avatar", "编辑头像"))}" title="${escapeHtml(pickUiText(language, "Edit avatar", "编辑头像"))}">
+          <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+            <path d="M4 20h4l10.6-10.6a2.2 2.2 0 0 0 0-3.1l-0.9-0.9a2.2 2.2 0 0 0-3.1 0L4 16v4Z" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/>
+            <path d="M13.8 6.2l4 4" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+          </svg>
+        </button>
       </div>`;
       return `<article class="office-card">
         <div class="office-head">
@@ -11302,6 +12129,593 @@ function renderQuotaResetScript(): string {
     const raw = node.getAttribute('data-quota-reset-at') || '';
     const windowLabel = node.getAttribute('data-quota-window') || '';
     node.textContent = formatReset(raw, windowLabel);
+  });
+})();
+</script>`;
+}
+
+function renderHeaderControlsScript(language: UiLanguage = "zh"): string {
+  const t = (en: string, zh: string): string => pickUiText(language, en, zh);
+  return `<script>
+(() => {
+  const themeKey = 'openclaw:theme';
+  const restoreKey = 'openclaw:refresh-state:v1:' + location.pathname + location.search;
+
+  const applyTheme = (theme) => {
+    const normalized = (theme === 'dark' || theme === 'light') ? theme : 'light';
+    document.documentElement.dataset.theme = normalized;
+    try { window.localStorage.setItem(themeKey, normalized); } catch {}
+  };
+
+  const setupThemeToggle = () => {
+    const themeToggle = document.getElementById('theme-toggle');
+    if (themeToggle) {
+      themeToggle.addEventListener('click', () => {
+        const current = (document.documentElement.dataset.theme || 'light').trim().toLowerCase();
+        applyTheme(current === 'dark' ? 'light' : 'dark');
+      });
+    }
+  };
+
+  // 确保在DOM加载完成后设置主题切换
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', setupThemeToggle);
+  } else {
+    setupThemeToggle();
+  }
+
+  const setupRefreshButton = () => {
+    const refreshButton = document.getElementById('data-refresh');
+    if (refreshButton) {
+      refreshButton.addEventListener('click', () => {
+        try {
+          refreshButton.setAttribute('aria-busy', 'true');
+        } catch {}
+        try { window.sessionStorage.setItem(restoreKey, JSON.stringify(captureState())); } catch {}
+        window.setTimeout(() => location.reload(), 60);
+      });
+    }
+  };
+
+  const captureState = () => {
+    const inputs = Array.from(document.querySelectorAll('input, textarea, select'));
+    const items = inputs.map((node) => {
+      const el = node;
+      const name = el.getAttribute('name') || '';
+      const id = el.getAttribute('id') || '';
+      const key = id ? ('#' + id) : (name ? (el.tagName.toLowerCase() + '[name="' + name.replace(/"/g, '\\"') + '"]') : '');
+      if (!key) return null;
+      const type = (el instanceof HTMLInputElement ? (el.type || '').toLowerCase() : '');
+      if (el instanceof HTMLInputElement && (type === 'checkbox' || type === 'radio')) {
+        return { key, kind: 'checked', value: Boolean(el.checked) };
+      }
+      const value = (el instanceof HTMLSelectElement || el instanceof HTMLTextAreaElement || el instanceof HTMLInputElement) ? el.value : '';
+      const selectionStart = (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) ? el.selectionStart : null;
+      const selectionEnd = (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) ? el.selectionEnd : null;
+      return { key, kind: 'value', value, selectionStart, selectionEnd };
+    }).filter(Boolean);
+
+    const focused = document.activeElement;
+    const focusedKey = (focused && focused instanceof HTMLElement)
+      ? (focused.id ? ('#' + focused.id) : (focused.getAttribute('name') ? (focused.tagName.toLowerCase() + '[name="' + focused.getAttribute('name').replace(/"/g, '\\"') + '"]') : ''))
+      : '';
+
+    return {
+      at: Date.now(),
+      scrollY: window.scrollY || 0,
+      focusedKey,
+      items,
+    };
+  };
+
+  const restoreState = (state) => {
+    if (!state || typeof state !== 'object') return;
+    const items = Array.isArray(state.items) ? state.items : [];
+    items.forEach((item) => {
+      if (!item || typeof item !== 'object') return;
+      const key = String(item.key || '');
+      if (!key) return;
+      const el = document.querySelector(key);
+      if (!el) return;
+      const kind = String(item.kind || '');
+      if (el instanceof HTMLInputElement && (el.type === 'checkbox' || el.type === 'radio') && kind === 'checked') {
+        el.checked = Boolean(item.value);
+        return;
+      }
+      if ((el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement || el instanceof HTMLSelectElement) && kind === 'value') {
+        el.value = String(item.value ?? '');
+        if (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) {
+          const ss = Number(item.selectionStart);
+          const se = Number(item.selectionEnd);
+          if (Number.isFinite(ss) && Number.isFinite(se)) {
+            try { el.setSelectionRange(ss, se); } catch {}
+          }
+        }
+      }
+    });
+
+    if (Number.isFinite(Number(state.scrollY))) {
+      window.scrollTo({ top: Number(state.scrollY), left: 0, behavior: 'instant' });
+    }
+    if (state.focusedKey && typeof state.focusedKey === 'string') {
+      const target = document.querySelector(state.focusedKey);
+      if (target && target instanceof HTMLElement) {
+        try { target.focus(); } catch {}
+      }
+    }
+  };
+
+  // 确保在DOM加载完成后设置刷新按钮
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', setupRefreshButton);
+  } else {
+    setupRefreshButton();
+  }
+
+  const bootRestore = () => {
+    let raw = '';
+    try { raw = window.sessionStorage.getItem(restoreKey) || ''; } catch {}
+    if (!raw) return;
+    let parsed = null;
+    try { parsed = JSON.parse(raw); } catch { parsed = null; }
+    try { window.sessionStorage.removeItem(restoreKey); } catch {}
+    if (!parsed) return;
+    window.requestAnimationFrame(() => {
+      restoreState(parsed);
+    });
+  };
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', bootRestore, { once: true });
+  } else {
+    bootRestore();
+  }
+})();
+</script>`;
+}
+
+function renderAvatarEditorScript(language: UiLanguage = "zh"): string {
+  const labels = {
+    pixel: pickUiText(language, "Pixel", "像素画"),
+    custom: pickUiText(language, "Custom", "自定义"),
+    agentConfig: pickUiText(language, "Current agent config", "当前Agent配置"),
+    editAvatar: pickUiText(language, "Edit avatar", "编辑头像"),
+    upload: pickUiText(language, "Upload avatar", "上传头像"),
+    apply: pickUiText(language, "Apply", "应用"),
+    delete: pickUiText(language, "Delete", "删除"),
+    recrop: pickUiText(language, "Edit", "编辑"),
+    loading: pickUiText(language, "Loading…", "加载中…"),
+    emptyUploads: pickUiText(language, "No uploaded avatars yet.", "还没有上传头像。"),
+    chooseFile: pickUiText(language, "Choose file", "选择文件"),
+    saving: pickUiText(language, "Saving…", "保存中…"),
+    save: pickUiText(language, "Save", "保存"),
+    saveOk: pickUiText(language, "Saved successfully", "保存成功"),
+    failed: pickUiText(language, "Operation failed.", "操作失败。"),
+  };
+  const animalLabels: Record<string, string> = {
+    robot: animalLabel("robot", language),
+    lion: animalLabel("lion", language),
+    tiger: animalLabel("tiger", language),
+    panda: animalLabel("panda", language),
+    monkey: animalLabel("monkey", language),
+    dolphin: animalLabel("dolphin", language),
+    owl: animalLabel("owl", language),
+    fox: animalLabel("fox", language),
+    bear: animalLabel("bear", language),
+    eagle: animalLabel("eagle", language),
+    otter: animalLabel("otter", language),
+    rooster: animalLabel("rooster", language),
+  };
+  const animals = Object.keys(animalLabels);
+  return `<script>
+(() => {
+  const L = ${JSON.stringify(labels)};
+  const ANIMALS = ${JSON.stringify(animals)};
+  const ANIMAL_LABELS = ${JSON.stringify(animalLabels)};
+  const avatarPrefKey = (agentId) => 'openclaw:avatar-pref:' + agentId;
+  const readAvatarPref = (agentId) => {
+    if (!agentId) return null;
+    try {
+      const raw = window.localStorage.getItem(avatarPrefKey(agentId)) || '';
+      if (!raw) return null;
+      const parsed = JSON.parse(raw);
+      return parsed && typeof parsed === 'object' ? parsed : null;
+    } catch {
+      return null;
+    }
+  };
+  const writeAvatarPref = (agentId, pref) => {
+    if (!agentId || !pref) return;
+    try { window.localStorage.setItem(avatarPrefKey(agentId), JSON.stringify(pref)); } catch {}
+  };
+
+  const esc = (s) => String(s || '').replace(/[&<>"']/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+  const q = (sel, root) => (root || document).querySelector(sel);
+  const qa = (sel, root) => Array.from((root || document).querySelectorAll(sel));
+
+  const ensureCanvas = (avatarEl, canvasSize) => {
+    const stage = q('.agent-stage', avatarEl);
+    if (!stage) return null;
+    let canvas = q('canvas.agent-pixel-canvas', stage);
+    if (!canvas) {
+      stage.innerHTML = '<canvas class="agent-pixel-canvas" width="' + canvasSize + '" height="' + canvasSize + '"></canvas>';
+      canvas = q('canvas.agent-pixel-canvas', stage);
+    }
+    return canvas;
+  };
+
+  const renderStaticPixel = (avatarEl) => {
+    const api = window.__openclawPixelAvatar;
+    if (api && typeof api.renderElement === 'function') {
+      api.renderElement(avatarEl);
+      return true;
+    }
+    return false;
+  };
+
+  const applyAvatarDom = (avatarEl, next) => {
+    const stage = q('.agent-stage', avatarEl);
+    if (!stage) return;
+    if (next.mode === 'custom') {
+      const src = next.imageDataUrl ? next.imageDataUrl : ('/avatars/' + esc(next.image));
+      stage.innerHTML = '<img class="agent-avatar-img" src="' + src + '" alt="" loading="lazy" />';
+      avatarEl.dataset.avatarMode = 'custom';
+      avatarEl.dataset.avatarImage = next.image || '';
+      if (window.__openclawPixelAvatar && typeof window.__openclawPixelAvatar.updateAvatar === 'function') {
+        window.__openclawPixelAvatar.updateAvatar(avatarEl, next);
+      }
+      return;
+    }
+    const canvasSize = avatarEl.classList.contains('agent-avatar') ? 224 : 256;
+    ensureCanvas(avatarEl, canvasSize);
+    avatarEl.dataset.avatarMode = 'pixel';
+    avatarEl.dataset.avatarImage = '';
+    avatarEl.dataset.animal = next.animal;
+    // 直接渲染静态像素，确保头像更新
+    renderStaticPixel(avatarEl);
+  };
+
+  const openModal = (avatarEl) => {
+    const agentId = (avatarEl.dataset.agentId || '').trim();
+    const displayName = (q('h3', avatarEl.closest('.staff-brief-card') || document.body)?.textContent || agentId || 'Agent').trim();
+    const backdrop = document.createElement('div');
+    backdrop.className = 'avatar-modal-backdrop';
+    backdrop.innerHTML = \`
+      <div class="avatar-modal" role="dialog" aria-modal="true" aria-label="\${esc(L.editAvatar)}">
+        <div class="avatar-modal-head">
+          <div class="avatar-modal-title">\${esc(displayName)} · \${esc(L.editAvatar)}</div>
+          <div class="avatar-modal-actions">
+            <button type="button" class="avatar-modal-close" aria-label="Close" title="Close">X</button>
+          </div>
+        </div>
+        <div class="avatar-modal-body">
+          <div class="avatar-preview">
+            <div class="agent-stage"></div>
+            <div class="meta">\${esc(agentId)}</div>
+          </div>
+          <div class="avatar-panel">
+            <div class="avatar-tabs">
+              <button type="button" class="avatar-tab active" data-tab="pixel">\${esc(L.pixel)}</button>
+              <button type="button" class="avatar-tab" data-tab="custom">\${esc(L.custom)}</button>
+            </div>
+            \${''}
+            <div class="avatar-panel-body"></div>
+          </div>
+        </div>
+      </div>\`;
+    document.body.appendChild(backdrop);
+
+    const modal = q('.avatar-modal', backdrop);
+    const close = () => { try { backdrop.remove(); } catch {} };
+    q('.avatar-modal-close', backdrop)?.addEventListener('click', close);
+    backdrop.addEventListener('click', (e) => { if (e.target === backdrop) close(); });
+    window.addEventListener('keydown', (e) => { if (e.key === 'Escape') close(); }, { once: true });
+
+    const previewStage = q('.avatar-preview .agent-stage', backdrop);
+    const syncPreview = () => {
+      if (!previewStage) return;
+      previewStage.innerHTML = '';
+      const clone = avatarEl.cloneNode(true);
+      clone.classList.remove('staff-avatar');
+      clone.classList.remove('agent-avatar');
+      const stage = q('.agent-stage', clone);
+      if (stage) {
+        stage.style.borderRadius = '14px';
+      }
+      previewStage.appendChild(clone);
+      if (clone.dataset.avatarMode !== 'custom') {
+        // Ensure a canvas exists for preview, then render once.
+        const size = 200;
+        const stageEl = q('.agent-stage', clone);
+        if (stageEl) stageEl.innerHTML = '<canvas class="agent-pixel-canvas" width="' + size + '" height="' + size + '"></canvas>';
+        renderStaticPixel(clone);
+      }
+    };
+
+    const panelBody = q('.avatar-panel-body', backdrop);
+    const setBusy = (busy) => {
+      modal?.classList.toggle('is-busy', Boolean(busy));
+    };
+
+
+
+    const renderPixelTab = () => {
+      if (!panelBody) return;
+      panelBody.innerHTML = \`
+        <div class="avatar-grid">
+          <button type="button" class="avatar-choice" data-pixel="agent" data-apply="1" title="\${esc(L.agentConfig)}">
+            <div class="meta">\${esc(L.agentConfig)}</div>
+          </button>
+          \${ANIMALS.map((a) => \`
+            <button type="button" class="avatar-choice" data-pixel="\${esc(a)}" data-apply="1" title="\${esc(ANIMAL_LABELS[a] || a)}">
+              <div class="agent-stage" style="width:70px; aspect-ratio:1/1; border-radius:14px; overflow:hidden; display:grid; place-items:center;">
+                <canvas class="agent-pixel-canvas" width="96" height="96"></canvas>
+              </div>
+              <div class="avatar-choice-label">\${esc(ANIMAL_LABELS[a] || a)}</div>
+            </button>\`).join('')}
+        </div>\`;
+
+      // Render tiny previews.
+      qa('.avatar-choice[data-pixel]', panelBody).forEach((btn) => {
+        const animal = btn.getAttribute('data-pixel');
+        if (!animal || animal === 'agent') return;
+        const canvas = q('canvas.agent-pixel-canvas', btn);
+        const api = window.__openclawPixelAvatar;
+        if (canvas && api && typeof api.renderCanvas === 'function') {
+          api.renderCanvas(canvas, animal, getComputedStyle(avatarEl).getPropertyValue('--agent-accent').trim());
+        }
+      });
+
+      qa('.avatar-choice[data-pixel]', panelBody).forEach((btn) => {
+        btn.addEventListener('click', async () => {
+          const value = String(btn.getAttribute('data-pixel') || '');
+          setBusy(true);
+          try {
+            if (value === 'agent') {
+              // Revert to server-provided animal.
+              const baseAnimal = (avatarEl.getAttribute('data-animal') || avatarEl.dataset.animal || 'default').trim().toLowerCase();
+              applyAvatarDom(avatarEl, { mode: 'pixel', animal: baseAnimal });
+              writeAvatarPref(agentId, { mode: 'pixel', animal: baseAnimal });
+              syncPreview();
+              return;
+            }
+            const animal = value.trim().toLowerCase();
+            applyAvatarDom(avatarEl, { mode: 'pixel', animal });
+            writeAvatarPref(agentId, { mode: 'pixel', animal });
+            syncPreview();
+          } catch (e) {
+            const message = String(e && e.message);
+            alert(message || L.failed);
+          } finally {
+            setBusy(false);
+          }
+        });
+      });
+    };
+
+    const openCropper = async (file) => {
+      const url = URL.createObjectURL(file);
+      const img = new Image();
+      img.decoding = 'async';
+      img.src = url;
+      await new Promise((resolve) => { img.onload = resolve; img.onerror = resolve; });
+      URL.revokeObjectURL(url);
+      if (!img.naturalWidth || !img.naturalHeight) throw new Error('invalid image');
+
+      const cropBackdrop = document.createElement('div');
+      cropBackdrop.className = 'avatar-modal-backdrop';
+      cropBackdrop.innerHTML = \`
+        <div class="avatar-modal" role="dialog" aria-modal="true" aria-label="Crop">
+          <div class="avatar-modal-head">
+            <div class="avatar-modal-title">\${esc(L.upload)}</div>
+            <button type="button" class="avatar-modal-close" aria-label="Close" title="Close">X</button>
+          </div>
+          <div class="avatar-modal-body" style="grid-template-columns:1fr;">
+            <div class="avatar-crop-shell">
+              <canvas class="avatar-crop-canvas" width="420" height="420"></canvas>
+              <div class="avatar-crop-controls">
+                <label class="meta">Zoom <input type="range" min="1" max="3.2" step="0.01" value="1.6" /></label>
+                <button type="button" class="btn avatar-upload-btn" data-action="save">\${esc(L.apply)}</button>
+              </div>
+              <div class="meta">\${esc(L.chooseFile)}</div>
+            </div>
+          </div>
+        </div>\`;
+      document.body.appendChild(cropBackdrop);
+      const closeCrop = () => { try { cropBackdrop.remove(); } catch {} };
+      q('.avatar-modal-close', cropBackdrop)?.addEventListener('click', closeCrop);
+      cropBackdrop.addEventListener('click', (e) => { if (e.target === cropBackdrop) closeCrop(); });
+
+      const canvas = q('canvas.avatar-crop-canvas', cropBackdrop);
+      const zoomInput = q('input[type="range"]', cropBackdrop);
+      if (!canvas || !zoomInput) throw new Error('cropper missing');
+      const ctx = canvas.getContext('2d');
+      if (!ctx) throw new Error('no canvas');
+
+      const state = { zoom: Number(zoomInput.value) || 1.6, dx: 0, dy: 0, dragging: false, lastX: 0, lastY: 0 };
+      const draw = () => {
+        const cw = canvas.width;
+        const ch = canvas.height;
+        ctx.clearRect(0, 0, cw, ch);
+        const scale = state.zoom;
+        const iw = img.naturalWidth * scale;
+        const ih = img.naturalHeight * scale;
+        const x = (cw - iw) / 2 + state.dx;
+        const y = (ch - ih) / 2 + state.dy;
+        ctx.fillStyle = 'rgba(0,0,0,0.14)';
+        ctx.fillRect(0, 0, cw, ch);
+        ctx.drawImage(img, x, y, iw, ih);
+        ctx.strokeStyle = 'rgba(255,255,255,0.75)';
+        ctx.lineWidth = 2;
+        ctx.strokeRect(10, 10, cw - 20, ch - 20);
+      };
+      draw();
+      zoomInput.addEventListener('input', () => { state.zoom = Number(zoomInput.value) || 1.6; draw(); });
+      canvas.addEventListener('mousedown', (e) => { state.dragging = true; state.lastX = e.clientX; state.lastY = e.clientY; });
+      window.addEventListener('mouseup', () => { state.dragging = false; });
+      window.addEventListener('mousemove', (e) => {
+        if (!state.dragging) return;
+        const dx = e.clientX - state.lastX;
+        const dy = e.clientY - state.lastY;
+        state.lastX = e.clientX;
+        state.lastY = e.clientY;
+        state.dx += dx;
+        state.dy += dy;
+        draw();
+      });
+
+      const producePng = () => {
+        const out = document.createElement('canvas');
+        out.width = 256;
+        out.height = 256;
+        const octx = out.getContext('2d');
+        if (!octx) return null;
+        // Map inner crop rect (10..cw-10) to output.
+        const cw = canvas.width;
+        const ch = canvas.height;
+        const cropX = 10;
+        const cropY = 10;
+        const cropW = cw - 20;
+        const cropH = ch - 20;
+        const scale = state.zoom;
+        const iw = img.naturalWidth * scale;
+        const ih = img.naturalHeight * scale;
+        const x = (cw - iw) / 2 + state.dx;
+        const y = (ch - ih) / 2 + state.dy;
+        // Draw same image into out by sampling from the virtual canvas.
+        octx.fillStyle = '#ffffff';
+        octx.fillRect(0, 0, out.width, out.height);
+        // Compute source rect in image space.
+        const sx = (cropX - x) / scale;
+        const sy = (cropY - y) / scale;
+        const sw = cropW / scale;
+        const sh = cropH / scale;
+        octx.drawImage(img, sx, sy, sw, sh, 0, 0, out.width, out.height);
+        return out.toDataURL('image/png');
+      };
+
+      return await new Promise((resolve, reject) => {
+        q('[data-action="save"]', cropBackdrop)?.addEventListener('click', async () => {
+          try {
+            const dataUrl = producePng();
+            if (!dataUrl) throw new Error('encode failed');
+            closeCrop();
+            resolve({ dataUrl });
+          } catch (e) {
+            reject(e);
+          }
+        });
+      });
+    };
+
+    const renderCustomTab = () => {
+      if (!panelBody) return;
+      panelBody.innerHTML = \`
+        <div class="avatar-upload-row">
+          <button type="button" class="btn avatar-upload-btn" data-action="upload">\${esc(L.upload)}</button>
+          <div class="meta" data-upload-status>\${esc(L.loading)}</div>
+        </div>
+        <div class="avatar-upload-list" data-upload-list></div>\`;
+
+      const status = q('[data-upload-status]', panelBody);
+      const list = q('[data-upload-list]', panelBody);
+      const refresh = async () => {
+        if (!status || !list) return;
+        status.textContent = L.emptyUploads;
+        list.innerHTML = '';
+      };
+      refresh();
+
+      panelBody.addEventListener('click', async (e) => {
+        const target = e.target;
+        if (!(target instanceof HTMLElement)) return;
+        const action = target.getAttribute('data-action') || '';
+        if (!action) return;
+        if (action === 'upload') {
+          const input = document.createElement('input');
+          input.type = 'file';
+          input.accept = 'image/*';
+          input.onchange = async () => {
+            const file = input.files && input.files[0];
+            if (!file) return;
+            setBusy(true);
+            try {
+              const crop = await openCropper(file);
+              // local-only: keep data url in localStorage
+              const dataUrl = crop.dataUrl;
+              if (dataUrl) {
+                writeAvatarPref(agentId, { mode: 'custom', imageDataUrl: dataUrl });
+                applyAvatarDom(avatarEl, { mode: 'custom', imageDataUrl: dataUrl });
+                syncPreview();
+              }
+            } catch (err) {
+              const message = String(err && err.message);
+              alert(message || L.failed);
+            } finally {
+              setBusy(false);
+            }
+          };
+          input.click();
+        }
+      });
+    };
+
+    const setTab = (tab) => {
+      qa('.avatar-tab', backdrop).forEach((node) => node.classList.toggle('active', node.getAttribute('data-tab') === tab));
+      if (tab === 'custom') {
+        renderCustomTab();
+      } else {
+        renderPixelTab();
+      }
+    };
+    qa('.avatar-tab', backdrop).forEach((btn) => btn.addEventListener('click', () => setTab(btn.getAttribute('data-tab') || 'pixel')));
+
+    // Seed preview from current avatar element.
+    const mode = (avatarEl.dataset.avatarMode || 'pixel').trim();
+    const image = (avatarEl.dataset.avatarImage || '').trim();
+    if (previewStage) {
+      if (mode === 'custom' && image) {
+        previewStage.innerHTML = '<img class="agent-avatar-img" src="/avatars/' + esc(image) + '" alt="" loading="lazy" />';
+      } else {
+        previewStage.innerHTML = '<canvas class="agent-pixel-canvas" width="200" height="200"></canvas>';
+        const faux = document.createElement('div');
+        faux.dataset.animal = (avatarEl.dataset.animal || 'default');
+        faux.style.setProperty('--agent-accent', getComputedStyle(avatarEl).getPropertyValue('--agent-accent'));
+        faux.appendChild(previewStage.firstElementChild);
+        renderStaticPixel(faux);
+      }
+    }
+    setTab('pixel');
+    syncPreview();
+
+
+
+  };
+
+  // Hook all avatar edit buttons (staff + agent cards).
+  document.addEventListener('click', (e) => {
+    const target = e.target;
+    if (!(target instanceof HTMLElement)) return;
+    const btn = target.closest && target.closest('.avatar-edit-btn');
+    if (!btn) return;
+    const avatarEl = btn.closest('.staff-avatar, .agent-avatar');
+    if (!(avatarEl instanceof HTMLElement)) return;
+    e.preventDefault();
+    openModal(avatarEl);
+  });
+
+  // Apply local avatar preferences on load as a fallback for refresh.
+  qa('.staff-avatar[data-agent-id], .agent-avatar[data-agent-id]').forEach((avatarEl) => {
+    const agentId = (avatarEl.dataset.agentId || '').trim();
+    if (!agentId) return;
+    const pref = readAvatarPref(agentId);
+    if (!pref) return;
+    if (pref.mode === 'custom' && (pref.image || pref.imageDataUrl)) {
+      applyAvatarDom(avatarEl, { mode: 'custom', image: String(pref.image || ''), imageDataUrl: pref.imageDataUrl ? String(pref.imageDataUrl) : '' });
+      return;
+    }
+    if (pref.mode === 'pixel' && pref.animal) {
+      applyAvatarDom(avatarEl, { mode: 'pixel', animal: String(pref.animal) });
+    }
   });
 })();
 </script>`;
@@ -12233,6 +13647,36 @@ function renderAgentVisualEnhancerScript(): string {
     return hash / 0xffffffff;
   };
 
+  try {
+    const animals = Object.keys(spriteFactory).filter((key) => key !== 'default');
+    window.__openclawPixelAvatar = {
+      animals,
+      renderCanvas: (canvas, animal, accent) => {
+        render(canvas, (animal || 'default').trim().toLowerCase(), accent || '#4e79a7', { bob: 0, sway: 0, blink: 0 });
+      },
+      renderElement: (avatarEl) => {
+        if (!avatarEl) return;
+        const canvas = avatarEl.querySelector && avatarEl.querySelector('.agent-pixel-canvas');
+        if (!canvas) return;
+        const accent = getComputedStyle(avatarEl).getPropertyValue('--agent-accent').trim() || '#4e79a7';
+        const animal = (avatarEl.dataset && avatarEl.dataset.animal ? avatarEl.dataset.animal : 'default');
+        render(canvas, (animal || 'default').trim().toLowerCase(), accent, { bob: 0, sway: 0, blink: 0 });
+      },
+      updateAvatar: (avatarEl, next) => {
+        if (!avatarEl) return;
+        const canvas = avatarEl.querySelector && avatarEl.querySelector('.agent-pixel-canvas');
+        if (!canvas) return;
+        const actor = motionActors.find((item) => item.canvas === canvas);
+        if (!actor) return;
+        actor.animal = (next && next.animal ? next.animal : actor.animal);
+        actor.disabled = Boolean(next && next.mode === 'custom');
+        if (!actor.disabled) {
+          render(actor.canvas, actor.animal, actor.accent, { bob: 0, sway: 0, blink: 0 });
+        }
+      },
+    };
+  } catch {}
+
   const motionActors = [];
   const motionProfiles = {
     robot: { bobAmp: 1.2, swayAmp: 0.9, bobFreq: 1.0, swayFreq: 0.82, blinkThreshold: 0.988 },
@@ -12255,6 +13699,7 @@ function renderAgentVisualEnhancerScript(): string {
       accent,
       animal,
       seed: hashSeed(animal + ':' + accent + ':' + String(index + 1)),
+      disabled: false,
     });
   });
 
@@ -12269,6 +13714,8 @@ function renderAgentVisualEnhancerScript(): string {
 
   const step = (now) => {
     motionActors.forEach((actor) => {
+      if (!document.body.contains(actor.canvas)) return;
+      if (actor.disabled) return;
       const profile = motionProfiles[actor.animal] || motionProfiles.default;
       const phase = now * 0.0032 * profile.bobFreq + actor.seed * 9.7;
       const bob = Math.round(Math.sin(phase) * profile.bobAmp);
@@ -13689,6 +15136,88 @@ async function readRawBody(req: IncomingMessage, maxBytes: number): Promise<stri
 
   if (chunks.length === 0) return "";
   return Buffer.concat(chunks).toString("utf8").trim();
+}
+
+function normalizeSafeFileName(input: string): string | undefined {
+  const trimmed = String(input || "").trim();
+  if (!trimmed) return undefined;
+  if (trimmed.length > 160) return undefined;
+  if (trimmed.includes("/") || trimmed.includes("\\") || trimmed.includes("..")) return undefined;
+  if (/[\u0000-\u001F\u007F]/.test(trimmed)) return undefined;
+  return trimmed;
+}
+
+function avatarContentType(fileName: string): string {
+  const ext = extname(fileName).toLowerCase();
+  if (ext === ".png") return "image/png";
+  if (ext === ".jpg" || ext === ".jpeg") return "image/jpeg";
+  if (ext === ".webp") return "image/webp";
+  return "application/octet-stream";
+}
+
+async function serveAvatarFile(res: ServerResponse, rawFileName: string): Promise<void> {
+  const fileName = normalizeSafeFileName(rawFileName);
+  if (!fileName) return writeApiError(res, 404, "NOT_FOUND", "Avatar file not found.");
+  const filePath = join(AVATAR_UPLOADS_DIR, fileName);
+  try {
+    const buffer = await readFile(filePath);
+    res.writeHead(200, {
+      "content-type": avatarContentType(fileName),
+      "cache-control": "private, max-age=3600",
+    });
+    res.end(buffer);
+  } catch {
+    return writeApiError(res, 404, "NOT_FOUND", "Avatar file not found.");
+  }
+}
+
+async function writeAvatarUploadFromDataUrl(input: { dataUrl: string; fileNameHint?: string }): Promise<{ fileName: string; sizeBytes: number }> {
+  await mkdir(AVATAR_UPLOADS_DIR, { recursive: true });
+  const raw = String(input.dataUrl || "").trim();
+  const match = /^data:(image\/png|image\/jpeg|image\/webp);base64,([A-Za-z0-9+/=]+)$/.exec(raw);
+  if (!match) {
+    throw new RequestValidationError("dataUrl must be a base64 data URL for png/jpeg/webp.", 400);
+  }
+  const mime = match[1];
+  const base64 = match[2];
+  const buffer = Buffer.from(base64, "base64");
+  if (buffer.length === 0) throw new RequestValidationError("dataUrl is empty.", 400);
+  if (buffer.length > AVATAR_UPLOAD_MAX_BYTES) throw new RequestValidationError("Avatar upload too large.", 413);
+  const ext = mime === "image/png" ? ".png" : mime === "image/webp" ? ".webp" : ".jpg";
+  const hint = normalizeSafeFileName(input.fileNameHint || "");
+  const hintedBase = hint ? basename(hint, extname(hint)) : "";
+  const base = hintedBase && /^[a-zA-Z0-9._-]+$/.test(hintedBase) ? hintedBase.slice(0, 48) : "avatar";
+  const fileName = `${base}-${randomUUID()}${ext}`;
+  const filePath = join(AVATAR_UPLOADS_DIR, fileName);
+  await writeFile(filePath, buffer);
+  return { fileName, sizeBytes: buffer.length };
+}
+
+async function deleteAvatarUpload(rawFileName: string): Promise<boolean> {
+  const fileName = normalizeSafeFileName(rawFileName);
+  if (!fileName) return false;
+  const filePath = join(AVATAR_UPLOADS_DIR, fileName);
+  try {
+    await unlink(filePath);
+  } catch {
+    return false;
+  }
+
+  // Best-effort cleanup of preferences that reference this file.
+  try {
+    const prefs = await loadAvatarPreferences();
+    let mutated = false;
+    const next = { ...prefs.preferences, agents: { ...prefs.preferences.agents } };
+    for (const [agentId, pref] of Object.entries(next.agents)) {
+      if (pref?.mode === "custom" && pref.image === fileName) {
+        delete next.agents[agentId];
+        mutated = true;
+      }
+    }
+    if (mutated) await saveAvatarPreferences({ ...next, updatedAt: new Date().toISOString(), version: 1 });
+  } catch {}
+
+  return true;
 }
 
 function writeJson(res: ServerResponse, statusCode: number, body: unknown): void {
