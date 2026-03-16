@@ -50,7 +50,7 @@ export async function loadAvatarPreferences(): Promise<AvatarPreferencesLoadResu
     const fallback = defaultAvatarPreferences();
     const reason = error instanceof Error ? error.message : "unable to read preference file";
     issues = [`avatar preferences fallback applied: ${reason}`];
-    await writeAvatarPreferences(fallback);
+    // 只读模式：不自动创建文件，只返回默认配置
     return {
       path: AVATAR_PREFERENCES_PATH,
       preferences: fallback,
@@ -59,9 +59,7 @@ export async function loadAvatarPreferences(): Promise<AvatarPreferencesLoadResu
   }
 
   const normalized = normalizeAvatarPreferences(parsed);
-  if (normalized.issues.length > 0) {
-    await writeAvatarPreferences(normalized.preferences);
-  }
+  // 只读模式：不自动修复写入文件，只返回问题和规范化后的配置
 
   return {
     path: AVATAR_PREFERENCES_PATH,
