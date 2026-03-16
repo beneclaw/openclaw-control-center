@@ -41,5 +41,8 @@
     "cross-env": "^7.0.3",
     "tsx": "^4.20.0",
     "typescript": "^5.8.2"
+  },
+  "dependencies": {
+    "dotenv": "^17.3.1"
   }
 }

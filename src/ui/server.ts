@@ -6102,7 +6102,7 @@ async function renderHtml(
   const nativeMotionScript = renderNativeMotionScript(options.language);
   const quotaResetScript = renderQuotaResetScript();
   const headerControlsScript = renderHeaderControlsScript(options.language);
-  const avatarEditorScript = renderAvatarEditorScript(options.language);
+  const avatarEditorScript = renderAvatarEditorScript(options.language, IMPORT_MUTATION_ENABLED);
   const renderTotalMs = Math.round(performance.now() - renderStartedAt);
   if (renderTotalMs >= 1000) {
     console.warn("[mission-control] slow html render", {
@@ -12275,7 +12275,7 @@ function renderHeaderControlsScript(language: UiLanguage = "zh"): string {
 </script>`;
 }
 
-function renderAvatarEditorScript(language: UiLanguage = "zh"): string {
+function renderAvatarEditorScript(language: UiLanguage = "zh", importMutationEnabled: boolean = false): string {
   const labels = {
     pixel: pickUiText(language, "Pixel", "像素画"),
     custom: pickUiText(language, "Custom", "自定义"),
@@ -12313,6 +12313,7 @@ function renderAvatarEditorScript(language: UiLanguage = "zh"): string {
   const L = ${JSON.stringify(labels)};
   const ANIMALS = ${JSON.stringify(animals)};
   const ANIMAL_LABELS = ${JSON.stringify(animalLabels)};
+  const IMPORT_MUTATION_ENABLED = ${JSON.stringify(importMutationEnabled)};
   const avatarPrefKey = (agentId) => 'openclaw:avatar-pref:' + agentId;
   const readAvatarPref = (agentId) => {
     if (!agentId) return null;
@@ -12328,6 +12329,107 @@ function renderAvatarEditorScript(language: UiLanguage = "zh"): string {
   const writeAvatarPref = (agentId, pref) => {
     if (!agentId || !pref) return;
     try { window.localStorage.setItem(avatarPrefKey(agentId), JSON.stringify(pref)); } catch {}
+  };
+  const tokenKey = () => 'openclaw:local-api-token';
+  const readToken = () => {
+    try { return window.localStorage.getItem(tokenKey()) || ''; } catch { return ''; }
+  };
+  const writeToken = (token) => {
+    try { window.localStorage.setItem(tokenKey(), token || ''); } catch {}
+  };
+  const promptForToken = () => {
+    const token = window.prompt('服务器安全限制，请输入 LOCAL_API_TOKEN（详见.env）');
+    if (token && token.trim()) {
+      writeToken(token.trim());
+      return token.trim();
+    }
+    return null;
+  };
+  const saveAvatarToServer = async (agentId, pref) => {
+    if (!IMPORT_MUTATION_ENABLED || !agentId || !pref) return false;
+    let token = readToken();
+    if (!token) {
+      token = promptForToken();
+      if (!token) return false;
+    }
+    try {
+      const res = await fetch('/api/avatar/preferences', {
+        method: 'PATCH',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-local-token': token,
+        },
+        body: JSON.stringify({ agentId, mode: pref.mode, animal: pref.animal, image: pref.image }),
+      });
+      if (res.status === 401) {
+        // Token invalid, prompt again
+        token = promptForToken();
+        if (!token) return false;
+        const retryRes = await fetch('/api/avatar/preferences', {
+          method: 'PATCH',
+          headers: {
+            'Content-Type': 'application/json',
+            'x-local-token': token,
+          },
+          body: JSON.stringify({ agentId, mode: pref.mode, animal: pref.animal, image: pref.image }),
+        });
+        return retryRes.ok;
+      }
+      return res.ok;
+    } catch {
+      return false;
+    }
+  };
+  const loadAvatarFromServer = async (agentId) => {
+    if (!IMPORT_MUTATION_ENABLED || !agentId) return null;
+    try {
+      // GET request does not require token
+      const res = await fetch('/api/avatar/preferences?agentId=' + encodeURIComponent(agentId));
+      if (!res.ok) return null;
+      const data = await res.json();
+      return data && data.preference ? data.preference : null;
+    } catch {
+      return null;
+    }
+  };
+  const uploadAvatarToServer = async (dataUrl, fileNameHint) => {
+    if (!IMPORT_MUTATION_ENABLED || !dataUrl) return null;
+    let token = readToken();
+    if (!token) {
+      token = promptForToken();
+      if (!token) return null;
+    }
+    try {
+      const res = await fetch('/api/avatar/uploads', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-local-token': token,
+        },
+        body: JSON.stringify({ dataUrl, fileName: fileNameHint }),
+      });
+      if (res.status === 401) {
+        // Token invalid, prompt again
+        token = promptForToken();
+        if (!token) return null;
+        const retryRes = await fetch('/api/avatar/uploads', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'x-local-token': token,
+          },
+          body: JSON.stringify({ dataUrl, fileName: fileNameHint }),
+        });
+        if (!retryRes.ok) return null;
+        const data = await retryRes.json();
+        return data && data.upload ? data.upload : null;
+      }
+      if (!res.ok) return null;
+      const data = await res.json();
+      return data && data.upload ? data.upload : null;
+    } catch {
+      return null;
+    }
   };
 
   const esc = (s) => String(s || '').replace(/[&<>"']/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -12372,7 +12474,11 @@ function renderAvatarEditorScript(language: UiLanguage = "zh"): string {
     avatarEl.dataset.avatarMode = 'pixel';
     avatarEl.dataset.avatarImage = '';
     avatarEl.dataset.animal = next.animal;
-    // 直接渲染静态像素，确保头像更新
+    // 使用 updateAvatar 更新动画循环中的 actor，确保头像持续更新
+    if (window.__openclawPixelAvatar && typeof window.__openclawPixelAvatar.updateAvatar === 'function') {
+      window.__openclawPixelAvatar.updateAvatar(avatarEl, next);
+    }
+    // 立即渲染一次，确保头像立即显示
     renderStaticPixel(avatarEl);
   };
 
@@ -12477,12 +12583,20 @@ function renderAvatarEditorScript(language: UiLanguage = "zh"): string {
               const baseAnimal = (avatarEl.getAttribute('data-animal') || avatarEl.dataset.animal || 'default').trim().toLowerCase();
               applyAvatarDom(avatarEl, { mode: 'pixel', animal: baseAnimal });
               writeAvatarPref(agentId, { mode: 'pixel', animal: baseAnimal });
+              // Only save to server when IMPORT_MUTATION_ENABLED is true
+              if (IMPORT_MUTATION_ENABLED) {
+                await saveAvatarToServer(agentId, { mode: 'pixel', animal: baseAnimal });
+              }
               syncPreview();
               return;
             }
             const animal = value.trim().toLowerCase();
             applyAvatarDom(avatarEl, { mode: 'pixel', animal });
             writeAvatarPref(agentId, { mode: 'pixel', animal });
+            // Only save to server when IMPORT_MUTATION_ENABLED is true
+            if (IMPORT_MUTATION_ENABLED) {
+              await saveAvatarToServer(agentId, { mode: 'pixel', animal });
+            }
             syncPreview();
           } catch (e) {
             const message = String(e && e.message);
@@ -12642,11 +12756,25 @@ function renderAvatarEditorScript(language: UiLanguage = "zh"): string {
             setBusy(true);
             try {
               const crop = await openCropper(file);
-              // local-only: keep data url in localStorage
               const dataUrl = crop.dataUrl;
               if (dataUrl) {
-                writeAvatarPref(agentId, { mode: 'custom', imageDataUrl: dataUrl });
-                applyAvatarDom(avatarEl, { mode: 'custom', imageDataUrl: dataUrl });
+                if (IMPORT_MUTATION_ENABLED) {
+                  // Upload to server when IMPORT_MUTATION_ENABLED is true
+                  const upload = await uploadAvatarToServer(dataUrl, file.name);
+                  if (upload && upload.fileName) {
+                    writeAvatarPref(agentId, { mode: 'custom', image: upload.fileName });
+                    applyAvatarDom(avatarEl, { mode: 'custom', image: upload.fileName });
+                    await saveAvatarToServer(agentId, { mode: 'custom', image: upload.fileName });
+                  } else {
+                    // Fallback to localStorage if upload fails
+                    writeAvatarPref(agentId, { mode: 'custom', imageDataUrl: dataUrl });
+                    applyAvatarDom(avatarEl, { mode: 'custom', imageDataUrl: dataUrl });
+                  }
+                } else {
+                  // local-only: keep data url in localStorage
+                  writeAvatarPref(agentId, { mode: 'custom', imageDataUrl: dataUrl });
+                  applyAvatarDom(avatarEl, { mode: 'custom', imageDataUrl: dataUrl });
+                }
                 syncPreview();
               }
             } catch (err) {
@@ -12705,11 +12833,27 @@ function renderAvatarEditorScript(language: UiLanguage = "zh"): string {
     openModal(avatarEl);
   });
 
-  // Apply local avatar preferences on load as a fallback for refresh.
-  qa('.staff-avatar[data-agent-id], .agent-avatar[data-agent-id]').forEach((avatarEl) => {
+  // Apply avatar preferences on load.
+  // When IMPORT_MUTATION_ENABLED is true, prefer server config and sync to localStorage.
+  // When false, use localStorage only.
+  qa('.staff-avatar[data-agent-id], .agent-avatar[data-agent-id]').forEach(async (avatarEl) => {
     const agentId = (avatarEl.dataset.agentId || '').trim();
     if (!agentId) return;
-    const pref = readAvatarPref(agentId);
+    
+    let pref = null;
+    if (IMPORT_MUTATION_ENABLED) {
+      // Try to load from server first (GET does not require token)
+      pref = await loadAvatarFromServer(agentId);
+      if (pref) {
+        // Sync server config to localStorage
+        writeAvatarPref(agentId, pref);
+      }
+    }
+    // Fallback to localStorage if server config not available
+    if (!pref) {
+      pref = readAvatarPref(agentId);
+    }
+    
     if (!pref) return;
     if (pref.mode === 'custom' && (pref.image || pref.imageDataUrl)) {
       applyAvatarDom(avatarEl, { mode: 'custom', image: String(pref.image || ''), imageDataUrl: pref.imageDataUrl ? String(pref.imageDataUrl) : '' });
