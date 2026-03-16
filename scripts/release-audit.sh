@@ -15,7 +15,6 @@ done < <(
     -g '!dist/**' \
     -g '!runtime/**' \
     -g '!coverage/**' \
-    -g '!test/**' \
     -g '!scripts/release-audit.sh'
 )
 
