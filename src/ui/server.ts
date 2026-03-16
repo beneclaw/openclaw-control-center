@@ -11301,11 +11301,12 @@ function renderStaffOverviewCards(
         agentAnimal: card.identity.animal,
         preferences: avatarPreferences,
       });
+      const effectiveAnimal = effective.mode === "pixel" ? effective.animal : card.identity.animal;
       const stageInner =
         effective.mode === "custom"
           ? `<img class="agent-avatar-img" src="/avatars/${escapeHtml(effective.image)}" alt="${escapeHtml(card.displayName)}" loading="lazy" />`
           : `<canvas class="agent-pixel-canvas" width="256" height="256"></canvas>`;
-      const avatar = `<div class="staff-avatar" style="--agent-accent:${escapeHtml(card.identity.accent)};" data-agent-id="${escapeHtml(card.agentId)}" data-animal="${escapeHtml(card.identity.animal)}" data-avatar-mode="${escapeHtml(effective.mode)}" data-avatar-image="${escapeHtml(effective.mode === "custom" ? effective.image : "")}">
+      const avatar = `<div class="staff-avatar" style="--agent-accent:${escapeHtml(card.identity.accent)};" data-agent-id="${escapeHtml(card.agentId)}" data-animal="${escapeHtml(effectiveAnimal)}" data-avatar-mode="${escapeHtml(effective.mode)}" data-avatar-image="${escapeHtml(effective.mode === "custom" ? effective.image : "")}">
         <div class="agent-stage" aria-hidden="true">${stageInner}</div>
         <button type="button" class="avatar-edit-btn" aria-label="${escapeHtml(pickUiText(language, "Edit avatar", "编辑头像"))}" title="${escapeHtml(pickUiText(language, "Edit avatar", "编辑头像"))}">
           <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
@@ -11850,11 +11851,12 @@ function renderOfficeCards(
         agentAnimal: card.identity.animal,
         preferences: avatarPreferences,
       });
+      const effectiveAnimal = effective.mode === "pixel" ? effective.animal : card.identity.animal;
       const stageInner =
         effective.mode === "custom"
           ? `<img class="agent-avatar-img" src="/avatars/${escapeHtml(effective.image)}" alt="${escapeHtml(card.agentId)}" loading="lazy" />`
           : `<canvas class="agent-pixel-canvas" width="224" height="160"></canvas>`;
-      const avatar = `<div class="agent-avatar" style="--agent-accent:${escapeHtml(card.identity.accent)};" data-agent-id="${escapeHtml(card.agentId)}" data-animal="${escapeHtml(card.identity.animal)}" data-avatar-mode="${escapeHtml(effective.mode)}" data-avatar-image="${escapeHtml(effective.mode === "custom" ? effective.image : "")}">
+      const avatar = `<div class="agent-avatar" style="--agent-accent:${escapeHtml(card.identity.accent)};" data-agent-id="${escapeHtml(card.agentId)}" data-animal="${escapeHtml(effectiveAnimal)}" data-avatar-mode="${escapeHtml(effective.mode)}" data-avatar-image="${escapeHtml(effective.mode === "custom" ? effective.image : "")}">
         <div class="agent-stage" aria-hidden="true">${stageInner}</div>
         <div class="agent-animal-label">${escapeHtml(animalLabel(card.identity.animal, language))}</div>
         <button type="button" class="avatar-edit-btn" aria-label="${escapeHtml(pickUiText(language, "Edit avatar", "编辑头像"))}" title="${escapeHtml(pickUiText(language, "Edit avatar", "编辑头像"))}">
